@@ -1,5 +1,8 @@
 // LLVM Pass to detect if lambdas passed to forall capture RAJA::Reducer or mfem reducers
 //
+// This pass only checks forall functions that are annotated with:
+//   [[clang::annotate("check_reducer")]]
+//
 // Build with:
 //   clang++ -shared -fPIC ReducerDetectionPass.cpp -o ReducerDetectionPass.so \
 //     `llvm-config --cxxflags --ldflags`
@@ -14,6 +17,8 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
@@ -29,15 +34,30 @@ public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     bool foundReducer = false;
 
-    errs() << "=== RAJA/MFEM Reducer Detection Pass ===\n\n";
+    errs() << "=== RAJA/MFEM Reducer Detection Pass ===\n";
+    errs() << "Only checking annotated forall functions with [[clang::annotate(\"check_reducer\")]]\n\n";
+
+    // Build set of annotated functions
+    buildAnnotatedFunctions(M);
+
+    if (annotatedFunctions.empty()) {
+      errs() << "No annotated forall functions found.\n";
+      errs() << "To enable checking, annotate your forall template with:\n";
+      errs() << "  [[clang::annotate(\"check_reducer\")]]\n\n";
+      return PreservedAnalyses::all();
+    }
+
+    errs() << "Found " << annotatedFunctions.size() << " annotated function(s) to check\n\n";
 
     // Find all forall-related function calls
     for (Function &F : M) {
       for (BasicBlock &BB : F) {
         for (Instruction &I : BB) {
           if (auto *Call = dyn_cast<CallInst>(&I)) {
-            if (isForallFunction(Call->getCalledFunction())) {
-              errs() << "Found forall call in function: " << F.getName() << "\n";
+            Function *CalledFunc = Call->getCalledFunction();
+            if (CalledFunc && isAnnotatedForall(CalledFunc)) {
+              errs() << "Checking annotated forall: " << CalledFunc->getName() << "\n";
+              errs() << "  Called from: " << F.getName() << "\n";
 
               // Check the lambda argument (usually first arg after N)
               if (analyzeLambdaForReducer(Call)) {
@@ -51,28 +71,52 @@ public:
     }
 
     if (!foundReducer) {
-      errs() << "No reducers detected in forall lambdas.\n";
+      errs() << "No reducers detected in annotated forall lambdas.\n";
     }
 
     return PreservedAnalyses::all();
   }
 
 private:
-  // Check if this is a forall-related function
-  bool isForallFunction(const Function *F) {
-    if (!F) return false;
+  std::set<const Function*> annotatedFunctions;
 
-    StringRef name = F->getName();
+  // Build set of functions that have the "check_reducer" annotation
+  void buildAnnotatedFunctions(Module &M) {
+    // Check for llvm.global.annotations
+    GlobalVariable *Annos = M.getNamedGlobal("llvm.global.annotations");
+    if (!Annos) return;
 
-    // Match various forall patterns
-    return name.contains("forall") ||
-           name.contains("ForallWrap") ||
-           name.contains("RajaCuWrap") ||
-           name.contains("RajaHipWrap") ||
-           name.contains("RajaOmpWrap") ||
-           name.contains("CuWrap") ||
-           name.contains("HipWrap") ||
-           name.contains("OmpWrap");
+    ConstantArray *CA = dyn_cast<ConstantArray>(Annos->getInitializer());
+    if (!CA) return;
+
+    for (unsigned i = 0; i < CA->getNumOperands(); ++i) {
+      ConstantStruct *CS = dyn_cast<ConstantStruct>(CA->getOperand(i));
+      if (!CS || CS->getNumOperands() < 2) continue;
+
+      // First operand is the annotated value (function)
+      Value *Annotated = CS->getOperand(0);
+      if (auto *Func = dyn_cast<Function>(Annotated->stripPointerCasts())) {
+        // Second operand is the annotation string
+        if (auto *AnnotationGEP = dyn_cast<ConstantExpr>(CS->getOperand(1))) {
+          if (auto *AnnotationVar = dyn_cast<GlobalVariable>(
+                AnnotationGEP->getOperand(0))) {
+            if (auto *AnnotationData = dyn_cast<ConstantDataArray>(
+                  AnnotationVar->getInitializer())) {
+              StringRef Annotation = AnnotationData->getAsCString();
+              if (Annotation == "check_reducer") {
+                annotatedFunctions.insert(Func);
+                errs() << "  Found annotated function: " << Func->getName() << "\n";
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Check if this function is annotated for reducer checking
+  bool isAnnotatedForall(const Function *F) {
+    return annotatedFunctions.count(F) > 0;
   }
 
   // Analyze the lambda argument to see if it captures a Reducer

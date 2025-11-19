@@ -2,6 +2,25 @@
 
 This directory contains an LLVM pass that detects whether lambdas passed to `forall` routines capture `RAJA::Reducer` or MFEM reducer types.
 
+**NEW:** The pass now only checks forall functions that are explicitly annotated with `[[clang::annotate("check_reducer")]]`. This gives you fine-grained control over which forall signatures to check!
+
+## Quick Start: Annotating Your Forall Functions
+
+To enable checking on a specific forall function, add the annotation:
+
+```cpp
+// In your forall.hpp or custom wrapper:
+template<typename BODY>
+[[clang::annotate("check_reducer")]]  // <-- Add this!
+void forall_checked(int N, BODY &&body) {
+  // ... your implementation ...
+}
+```
+
+Now only lambdas passed to `forall_checked` will be analyzed. Regular `forall` calls are ignored.
+
+**See `how_to_annotate_forall.hpp` for complete examples and best practices.**
+
 ## Why This Works (No Reflection Needed!)
 
 C++ lambdas are compiled to anonymous structs/classes where:
@@ -126,16 +145,87 @@ The pass **recursively** checks:
 
 ```
 === RAJA/MFEM Reducer Detection Pass ===
+Only checking annotated forall functions with [[clang::annotate("check_reducer")]]
 
-Found forall call in function: test_raja_reducer
+  Found annotated function: _ZN4mfem14forall_checkedIZ23test_checked_raja_reducervE3$_0EEviT_
+Found 1 annotated function(s) to check
+
+Checking annotated forall: _ZN4mfem14forall_checkedIZ23test_checked_raja_reducervE3$_0EEviT_
+  Called from: _Z23test_checked_raja_reducerv
+  Analyzing argument 0: i32
   Analyzing argument 1: %class.anon*
     Lambda struct type: class.anon
       Found RAJA::Reducer: class.RAJA::ReduceSum
     *** REDUCER DETECTED in lambda capture! ***
 
-Found forall call in function: test_no_reducer
-  Analyzing argument 1: %class.anon.0*
-    Lambda struct type: class.anon.0
+Checking annotated forall: _ZN4mfem14forall_checkedIZ23test_checked_no_reducervE3$_3EEviT_
+  Called from: _Z23test_checked_no_reducerv
+  Analyzing argument 0: i32
+  Analyzing argument 1: %class.anon.3*
+    Lambda struct type (by value): class.anon.3
+
+No reducers detected in annotated forall lambdas.
+```
+
+Note: Unchecked (non-annotated) forall calls are completely ignored!
+
+## Why Use Annotations?
+
+The annotation-based approach gives you several benefits:
+
+### 1. **Selective Checking**
+Only check the forall variants where reducer captures are actually problematic:
+```cpp
+// GPU backend - reducers are problematic, enable checking
+template<typename BODY>
+[[clang::annotate("check_reducer")]]
+void CuWrap1D(const int N, BODY &&d_body) { /* ... */ }
+
+// CPU backend - reducers might be OK, don't check
+template<typename BODY>
+void OmpWrap(const int N, BODY &&h_body) { /* ... */ }
+```
+
+### 2. **Gradual Adoption**
+Start by annotating only critical sections:
+```cpp
+// Phase 1: Only check performance-critical GPU kernels
+[[clang::annotate("check_reducer")]]
+void forall_pa_cuda(...) { /* ... */ }  // Partial assembly kernels
+
+// Phase 2: Later expand to other areas
+[[clang::annotate("check_reducer")]]
+void forall_matrix_free(...) { /* ... */ }
+```
+
+### 3. **Explicit Intent**
+The annotation serves as documentation:
+```cpp
+// This forall variant is safe for reducer usage
+template<typename BODY>
+void forall_with_reduction(int N, BODY &&body) { /* ... */ }
+
+// This forall variant should NOT use reducers - annotation enforces it!
+template<typename BODY>
+[[clang::annotate("check_reducer")]]
+void forall_device_kernel(int N, BODY &&body) { /* ... */ }
+```
+
+### 4. **No False Positives**
+Without annotations, the pass would flag ALL forall calls, including:
+- Test code
+- Examples
+- Cases where reducer captures are intentional and safe
+- Third-party code you don't control
+
+With annotations, you only check what you explicitly mark!
+
+### 5. **Multiple Annotation Types** (Future Extension)
+You could extend to support different annotations:
+```cpp
+[[clang::annotate("check_reducer")]]       // Error on reducers
+[[clang::annotate("warn_reducer")]]        // Warning only
+[[clang::annotate("check_raw_pointers")]]  // Check for other issues
 ```
 
 ## Advanced: Customizing the Pass
