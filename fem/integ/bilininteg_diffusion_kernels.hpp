@@ -985,11 +985,11 @@ inline void PADiffusionApply3D(const int NE,
 }
 
 // Tile abstraction for 3D thread blocks
-// Provides higher-level operations for 3D tiled computations
+// Encapsulates thread iteration patterns for 3D data
 namespace tile3d
 {
 
-// Represents a 3D tile with compile-time and runtime dimensions
+// Represents threading dimensions for a 3D tile
 template<int MX, int MY, int MZ>
 struct Tile
 {
@@ -997,7 +997,7 @@ struct Tile
 
    MFEM_HOST_DEVICE Tile(int x, int y, int z) : nx(x), ny(y), nz(z) {}
 
-   // Load a 3D tile from global memory to shared memory
+   // Load a 3D tile from global memory using this tile's threading pattern
    template<typename SrcView, typename DstArray>
    MFEM_HOST_DEVICE void load(const SrcView &src, DstArray &dst, int elem) const
    {
@@ -1013,9 +1013,22 @@ struct Tile
       }
    }
 
-   // Store a 3D tile from shared memory to global memory
-   template<typename SrcArray, typename DstView>
-   MFEM_HOST_DEVICE void store(const SrcArray &src, DstView &dst, int elem) const
+   // Execute a lambda for each thread in this tile's X-Y plane at given Z
+   template<typename Lambda>
+   MFEM_HOST_DEVICE void forXY(Lambda&& func) const
+   {
+      MFEM_FOREACH_THREAD_DIRECT(iy,y,ny)
+      {
+         MFEM_FOREACH_THREAD_DIRECT(ix,x,nx)
+         {
+            func(ix, iy);
+         }
+      }
+   }
+
+   // Execute a lambda for each thread in this tile
+   template<typename Lambda>
+   MFEM_HOST_DEVICE void forXYZ(Lambda&& func) const
    {
       MFEM_FOREACH_THREAD_DIRECT(iz,z,nz)
       {
@@ -1023,108 +1036,31 @@ struct Tile
          {
             MFEM_FOREACH_THREAD_DIRECT(ix,x,nx)
             {
-               dst(ix,iy,iz,elem) += src[iz][iy][ix];
+               func(ix, iy, iz);
             }
          }
       }
    }
+};
 
-   // Apply tensor contraction along X direction: result[z][y][qx] = sum_dx B/G[qx][dx] * input[z][y][dx]
-   template<typename InputArray, typename BasisArray, typename OutputArray>
-   MFEM_HOST_DEVICE void contractX(const InputArray &input,
-                                    const BasisArray &basis_b,
-                                    const BasisArray &basis_g,
-                                    OutputArray &out_b,
-                                    OutputArray &out_g,
-                                    int nq) const
+// Helper to create a mixed-dimension tile (e.g., D x D x Q)
+template<int MX, int MY, int MZ>
+struct MixedTile
+{
+   int nx, ny, nz;
+
+   MFEM_HOST_DEVICE MixedTile(int x, int y, int z) : nx(x), ny(y), nz(z) {}
+
+   template<typename Lambda>
+   MFEM_HOST_DEVICE void forEach(Lambda&& func) const
    {
       MFEM_FOREACH_THREAD_DIRECT(iz,z,nz)
       {
          MFEM_FOREACH_THREAD_DIRECT(iy,y,ny)
          {
-            MFEM_FOREACH_THREAD_DIRECT(iq,x,nq)
+            MFEM_FOREACH_THREAD_DIRECT(ix,x,nx)
             {
-               real_t sum_b = 0.0, sum_g = 0.0;
-               MFEM_UNROLL(MX)
-               for (int ix = 0; ix < nx; ++ix)
-               {
-                  const real_t val = input[iz][iy][ix];
-                  sum_b += val * basis_b[iq][ix];
-                  sum_g += val * basis_g[iq][ix];
-               }
-               out_b[iz][iy][iq] = sum_b;
-               out_g[iz][iy][iq] = sum_g;
-            }
-         }
-      }
-   }
-
-   // Apply tensor contraction along Y direction with two inputs
-   template<typename Input1, typename Input2, typename BasisArray, typename Output>
-   MFEM_HOST_DEVICE void contractY(const Input1 &in1, const Input2 &in2,
-                                    const BasisArray &basis_b,
-                                    const BasisArray &basis_g,
-                                    Output &out1, Output &out2, Output &out3,
-                                    int nq_in, int nq_out) const
-   {
-      MFEM_FOREACH_THREAD_DIRECT(iz,z,nz)
-      {
-         MFEM_FOREACH_THREAD_DIRECT(iq_out,y,nq_out)
-         {
-            MFEM_FOREACH_THREAD_DIRECT(iq_in,x,nq_in)
-            {
-               real_t u = 0.0, v = 0.0, w = 0.0;
-               MFEM_UNROLL(MY)
-               for (int iy = 0; iy < ny; ++iy)
-               {
-                  u += in1[iz][iy][iq_in] * basis_b[iq_out][iy];
-                  v += in2[iz][iy][iq_in] * basis_g[iq_out][iy];
-                  w += in2[iz][iy][iq_in] * basis_b[iq_out][iy];
-               }
-               out1[iz][iq_out][iq_in] = u;
-               out2[iz][iq_out][iq_in] = v;
-               out3[iz][iq_out][iq_in] = w;
-            }
-         }
-      }
-   }
-
-   // Apply tensor contraction along Z direction and apply diffusion operator
-   template<typename Input, typename DiffusionCoeff, typename Output>
-   MFEM_HOST_DEVICE void contractZAndApplyDiffusion(
-      const Input &in1, const Input &in2, const Input &in3,
-      const DiffusionCoeff &coeff, Output &out1, Output &out2, Output &out3,
-      int nq, int elem, bool symmetric) const
-   {
-      MFEM_FOREACH_THREAD_DIRECT(iqz,z,nq)
-      {
-         MFEM_FOREACH_THREAD_DIRECT(iqy,y,nq)
-         {
-            MFEM_FOREACH_THREAD_DIRECT(iqx,x,nq)
-            {
-               real_t grad_x = 0.0, grad_y = 0.0, grad_z = 0.0;
-               MFEM_UNROLL(MZ)
-               for (int iz = 0; iz < nz; ++iz)
-               {
-                  grad_x += in1[iz][iqy][iqx] * coeff[iqz][iz];  // B basis
-                  grad_y += in2[iz][iqy][iqx] * coeff[iqz][iz];  // B basis
-                  grad_z += in3[iz][iqy][iqx] * (iz < nz ? coeff[iqz][iz] : 0.0);  // G basis (placeholder)
-               }
-
-               // Apply diffusion tensor
-               const real_t O11 = coeff(iqx,iqy,iqz,0,elem);
-               const real_t O12 = coeff(iqx,iqy,iqz,1,elem);
-               const real_t O13 = coeff(iqx,iqy,iqz,2,elem);
-               const real_t O21 = symmetric ? O12 : coeff(iqx,iqy,iqz,3,elem);
-               const real_t O22 = symmetric ? coeff(iqx,iqy,iqz,3,elem) : coeff(iqx,iqy,iqz,4,elem);
-               const real_t O23 = symmetric ? coeff(iqx,iqy,iqz,4,elem) : coeff(iqx,iqy,iqz,5,elem);
-               const real_t O31 = symmetric ? O13 : coeff(iqx,iqy,iqz,6,elem);
-               const real_t O32 = symmetric ? O23 : coeff(iqx,iqy,iqz,7,elem);
-               const real_t O33 = symmetric ? coeff(iqx,iqy,iqz,5,elem) : coeff(iqx,iqy,iqz,8,elem);
-
-               out1[iqz][iqy][iqx] = (O11*grad_x) + (O12*grad_y) + (O13*grad_z);
-               out2[iqz][iqy][iqx] = (O21*grad_x) + (O22*grad_y) + (O23*grad_z);
-               out3[iqz][iqy][iqx] = (O31*grad_x) + (O32*grad_y) + (O33*grad_z);
+               func(ix, iy, iz);
             }
          }
       }
@@ -1200,184 +1136,148 @@ inline void SmemPADiffusionApply3D(const int NE,
       real_t (*QDD1)[MD1][MD1] = (real_t (*)[MD1][MD1]) (sm0+1);
       real_t (*QDD2)[MD1][MD1] = (real_t (*)[MD1][MD1]) (sm0+2);
 
-      // Load input tile from global to shared memory
+      // Load input tile from global to shared memory using tile abstraction
       dof_tile.load(x, X, e);
 
       // Load basis functions to shared memory (only one z-layer needed)
       if (MFEM_THREAD_ID(z) == 0)
       {
-         MFEM_FOREACH_THREAD_DIRECT(dy,y,D1D)
+         tile3d::MixedTile<MQ1, MD1, 1> basis_tile(Q1D, D1D, 1);
+         basis_tile.forXY([&](int qx, int dy)
          {
-            MFEM_FOREACH_THREAD_DIRECT(qx,x,Q1D)
-            {
-               B[qx][dy] = b(qx,dy);
-               G[qx][dy] = g(qx,dy);
-            }
-         }
+            B[qx][dy] = b(qx,dy);
+            G[qx][dy] = g(qx,dy);
+         });
       }
       MFEM_SYNC_THREAD;
 
       // Forward pass: DOF -> Quadrature
-      // Step 1: Contract along X direction (D->Q in X)
-      MFEM_FOREACH_THREAD_DIRECT(dz,z,D1D)
+      // Step 1: Contract along X direction (D->Q in X) using mixed tile
+      tile3d::MixedTile<MQ1, MD1, MD1> ddq_tile(Q1D, D1D, D1D);
+      ddq_tile.forEach([&](int qx, int dy, int dz)
       {
-         MFEM_FOREACH_THREAD_DIRECT(dy,y,D1D)
+         real_t u = 0.0, v = 0.0;
+         MFEM_UNROLL(MD1)
+         for (int dx = 0; dx < D1D; ++dx)
          {
-            MFEM_FOREACH_THREAD_DIRECT(qx,x,Q1D)
-            {
-               real_t u = 0.0, v = 0.0;
-               MFEM_UNROLL(MD1)
-               for (int dx = 0; dx < D1D; ++dx)
-               {
-                  const real_t coords = X[dz][dy][dx];
-                  u += coords * B[qx][dx];
-                  v += coords * G[qx][dx];
-               }
-               DDQ0[dz][dy][qx] = u;
-               DDQ1[dz][dy][qx] = v;
-            }
+            const real_t coords = X[dz][dy][dx];
+            u += coords * B[qx][dx];
+            v += coords * G[qx][dx];
          }
-      }
+         DDQ0[dz][dy][qx] = u;
+         DDQ1[dz][dy][qx] = v;
+      });
       MFEM_SYNC_THREAD;
 
-      // Step 2: Contract along Y direction (D->Q in Y)
-      MFEM_FOREACH_THREAD_DIRECT(dz,z,D1D)
+      // Step 2: Contract along Y direction (D->Q in Y) using mixed tile
+      tile3d::MixedTile<MQ1, MQ1, MD1> dqq_tile(Q1D, Q1D, D1D);
+      dqq_tile.forEach([&](int qx, int qy, int dz)
       {
-         MFEM_FOREACH_THREAD_DIRECT(qy,y,Q1D)
+         real_t u = 0.0, v = 0.0, w = 0.0;
+         MFEM_UNROLL(MD1)
+         for (int dy = 0; dy < D1D; ++dy)
          {
-            MFEM_FOREACH_THREAD_DIRECT(qx,x,Q1D)
-            {
-               real_t u = 0.0, v = 0.0, w = 0.0;
-               MFEM_UNROLL(MD1)
-               for (int dy = 0; dy < D1D; ++dy)
-               {
-                  u += DDQ1[dz][dy][qx] * B[qy][dy];
-                  v += DDQ0[dz][dy][qx] * G[qy][dy];
-                  w += DDQ0[dz][dy][qx] * B[qy][dy];
-               }
-               DQQ0[dz][qy][qx] = u;
-               DQQ1[dz][qy][qx] = v;
-               DQQ2[dz][qy][qx] = w;
-            }
+            u += DDQ1[dz][dy][qx] * B[qy][dy];
+            v += DDQ0[dz][dy][qx] * G[qy][dy];
+            w += DDQ0[dz][dy][qx] * B[qy][dy];
          }
-      }
+         DQQ0[dz][qy][qx] = u;
+         DQQ1[dz][qy][qx] = v;
+         DQQ2[dz][qy][qx] = w;
+      });
       MFEM_SYNC_THREAD;
 
-      // Step 3: Contract along Z direction (D->Q in Z) and apply diffusion operator
-      MFEM_FOREACH_THREAD_DIRECT(qz,z,Q1D)
+      // Step 3: Contract along Z (D->Q) and apply diffusion operator using quad tile
+      quad_tile.forXYZ([&](int qx, int qy, int qz)
       {
-         MFEM_FOREACH_THREAD_DIRECT(qy,y,Q1D)
+         real_t u = 0.0, v = 0.0, w = 0.0;
+         MFEM_UNROLL(MD1)
+         for (int dz = 0; dz < D1D; ++dz)
          {
-            MFEM_FOREACH_THREAD_DIRECT(qx,x,Q1D)
-            {
-               real_t u = 0.0, v = 0.0, w = 0.0;
-               MFEM_UNROLL(MD1)
-               for (int dz = 0; dz < D1D; ++dz)
-               {
-                  u += DQQ0[dz][qy][qx] * B[qz][dz];
-                  v += DQQ1[dz][qy][qx] * B[qz][dz];
-                  w += DQQ2[dz][qy][qx] * G[qz][dz];
-               }
-               const real_t O11 = d(qx,qy,qz,0,e);
-               const real_t O12 = d(qx,qy,qz,1,e);
-               const real_t O13 = d(qx,qy,qz,2,e);
-               const real_t O21 = symmetric ? O12 : d(qx,qy,qz,3,e);
-               const real_t O22 = symmetric ? d(qx,qy,qz,3,e) : d(qx,qy,qz,4,e);
-               const real_t O23 = symmetric ? d(qx,qy,qz,4,e) : d(qx,qy,qz,5,e);
-               const real_t O31 = symmetric ? O13 : d(qx,qy,qz,6,e);
-               const real_t O32 = symmetric ? O23 : d(qx,qy,qz,7,e);
-               const real_t O33 = symmetric ? d(qx,qy,qz,5,e) : d(qx,qy,qz,8,e);
-               const real_t gX = u;
-               const real_t gY = v;
-               const real_t gZ = w;
-               QQQ0[qz][qy][qx] = (O11*gX) + (O12*gY) + (O13*gZ);
-               QQQ1[qz][qy][qx] = (O21*gX) + (O22*gY) + (O23*gZ);
-               QQQ2[qz][qy][qx] = (O31*gX) + (O32*gY) + (O33*gZ);
-            }
+            u += DQQ0[dz][qy][qx] * B[qz][dz];
+            v += DQQ1[dz][qy][qx] * B[qz][dz];
+            w += DQQ2[dz][qy][qx] * G[qz][dz];
          }
-      }
+         const real_t O11 = d(qx,qy,qz,0,e);
+         const real_t O12 = d(qx,qy,qz,1,e);
+         const real_t O13 = d(qx,qy,qz,2,e);
+         const real_t O21 = symmetric ? O12 : d(qx,qy,qz,3,e);
+         const real_t O22 = symmetric ? d(qx,qy,qz,3,e) : d(qx,qy,qz,4,e);
+         const real_t O23 = symmetric ? d(qx,qy,qz,4,e) : d(qx,qy,qz,5,e);
+         const real_t O31 = symmetric ? O13 : d(qx,qy,qz,6,e);
+         const real_t O32 = symmetric ? O23 : d(qx,qy,qz,7,e);
+         const real_t O33 = symmetric ? d(qx,qy,qz,5,e) : d(qx,qy,qz,8,e);
+         const real_t gX = u;
+         const real_t gY = v;
+         const real_t gZ = w;
+         QQQ0[qz][qy][qx] = (O11*gX) + (O12*gY) + (O13*gZ);
+         QQQ1[qz][qy][qx] = (O21*gX) + (O22*gY) + (O23*gZ);
+         QQQ2[qz][qy][qx] = (O31*gX) + (O32*gY) + (O33*gZ);
+      });
       MFEM_SYNC_THREAD;
 
-      // Load transposed basis functions
+      // Load transposed basis functions using tile abstraction
       if (MFEM_THREAD_ID(z) == 0)
       {
-         MFEM_FOREACH_THREAD_DIRECT(dy,y,D1D)
+         tile3d::MixedTile<MQ1, MD1, 1> basis_tile(Q1D, D1D, 1);
+         basis_tile.forXY([&](int qx, int dy)
          {
-            MFEM_FOREACH_THREAD_DIRECT(qx,x,Q1D)
-            {
-               Bt[dy][qx] = b(qx,dy);
-               Gt[dy][qx] = g(qx,dy);
-            }
-         }
+            Bt[dy][qx] = b(qx,dy);
+            Gt[dy][qx] = g(qx,dy);
+         });
       }
       MFEM_SYNC_THREAD;
 
       // Backward pass: Quadrature -> DOF
-      // Step 4: Contract along X direction (Q->D in X)
-      MFEM_FOREACH_THREAD_DIRECT(qz,z,Q1D)
+      // Step 4: Contract along X direction (Q->D in X) using mixed tile
+      tile3d::MixedTile<MD1, MQ1, MQ1> qqd_tile(D1D, Q1D, Q1D);
+      qqd_tile.forEach([&](int dx, int qy, int qz)
       {
-         MFEM_FOREACH_THREAD_DIRECT(qy,y,Q1D)
+         real_t u = 0.0, v = 0.0, w = 0.0;
+         MFEM_UNROLL(MQ1)
+         for (int qx = 0; qx < Q1D; ++qx)
          {
-            MFEM_FOREACH_THREAD_DIRECT(dx,x,D1D)
-            {
-               real_t u = 0.0, v = 0.0, w = 0.0;
-               MFEM_UNROLL(MQ1)
-               for (int qx = 0; qx < Q1D; ++qx)
-               {
-                  u += QQQ0[qz][qy][qx] * Gt[dx][qx];
-                  v += QQQ1[qz][qy][qx] * Bt[dx][qx];
-                  w += QQQ2[qz][qy][qx] * Bt[dx][qx];
-               }
-               QQD0[qz][qy][dx] = u;
-               QQD1[qz][qy][dx] = v;
-               QQD2[qz][qy][dx] = w;
-            }
+            u += QQQ0[qz][qy][qx] * Gt[dx][qx];
+            v += QQQ1[qz][qy][qx] * Bt[dx][qx];
+            w += QQQ2[qz][qy][qx] * Bt[dx][qx];
          }
-      }
+         QQD0[qz][qy][dx] = u;
+         QQD1[qz][qy][dx] = v;
+         QQD2[qz][qy][dx] = w;
+      });
       MFEM_SYNC_THREAD;
 
-      // Step 5: Contract along Y direction (Q->D in Y)
-      MFEM_FOREACH_THREAD_DIRECT(qz,z,Q1D)
+      // Step 5: Contract along Y direction (Q->D in Y) using mixed tile
+      tile3d::MixedTile<MD1, MD1, MQ1> qdd_tile(D1D, D1D, Q1D);
+      qdd_tile.forEach([&](int dx, int dy, int qz)
       {
-         MFEM_FOREACH_THREAD_DIRECT(dy,y,D1D)
+         real_t u = 0.0, v = 0.0, w = 0.0;
+         MFEM_UNROLL(Q1D)
+         for (int qy = 0; qy < Q1D; ++qy)
          {
-            MFEM_FOREACH_THREAD_DIRECT(dx,x,D1D)
-            {
-               real_t u = 0.0, v = 0.0, w = 0.0;
-               MFEM_UNROLL(Q1D)
-               for (int qy = 0; qy < Q1D; ++qy)
-               {
-                  u += QQD0[qz][qy][dx] * Bt[dy][qy];
-                  v += QQD1[qz][qy][dx] * Gt[dy][qy];
-                  w += QQD2[qz][qy][dx] * Bt[dy][qy];
-               }
-               QDD0[qz][dy][dx] = u;
-               QDD1[qz][dy][dx] = v;
-               QDD2[qz][dy][dx] = w;
-            }
+            u += QQD0[qz][qy][dx] * Bt[dy][qy];
+            v += QQD1[qz][qy][dx] * Gt[dy][qy];
+            w += QQD2[qz][qy][dx] * Bt[dy][qy];
          }
-      }
+         QDD0[qz][dy][dx] = u;
+         QDD1[qz][dy][dx] = v;
+         QDD2[qz][dy][dx] = w;
+      });
       MFEM_SYNC_THREAD;
 
-      // Step 6: Contract along Z direction (Q->D in Z) and accumulate to output
-      MFEM_FOREACH_THREAD_DIRECT(dz,z,D1D)
+      // Step 6: Contract along Z (Q->D) and accumulate to output using dof tile
+      dof_tile.forXYZ([&](int dx, int dy, int dz)
       {
-         MFEM_FOREACH_THREAD_DIRECT(dy,y,D1D)
+         real_t u = 0.0, v = 0.0, w = 0.0;
+         MFEM_UNROLL(MQ1)
+         for (int qz = 0; qz < Q1D; ++qz)
          {
-            MFEM_FOREACH_THREAD_DIRECT(dx,x,D1D)
-            {
-               real_t u = 0.0, v = 0.0, w = 0.0;
-               MFEM_UNROLL(MQ1)
-               for (int qz = 0; qz < Q1D; ++qz)
-               {
-                  u += QDD0[qz][dy][dx] * Bt[dz][qz];
-                  v += QDD1[qz][dy][dx] * Bt[dz][qz];
-                  w += QDD2[qz][dy][dx] * Gt[dz][qz];
-               }
-               y(dx,dy,dz,e) += (u + v + w);
-            }
+            u += QDD0[qz][dy][dx] * Bt[dz][qz];
+            v += QDD1[qz][dy][dx] * Bt[dz][qz];
+            w += QDD2[qz][dy][dx] * Gt[dz][qz];
          }
-      }
+         y(dx,dy,dz,e) += (u + v + w);
+      });
    });
 }
 
