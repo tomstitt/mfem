@@ -36,39 +36,18 @@ Set the precision for BoomerAMG preconditioner operations:
 #endif
 ```
 
-### HypreParVector
+### Why No ConvertTo* Methods for Vectors/Matrices?
 
-Convert vector storage between precisions:
+**Important:** MFEM does NOT provide `ConvertToSingle()/ConvertToDouble()` methods for
+`HypreParVector` and `HypreParMatrix` because:
 
-```cpp
-#ifdef HYPRE_MIXED_PRECISION
-   HypreParVector x(comm, global_size, col);
+1. **Memory Safety**: HYPRE's conversion functions reallocate internal data arrays
+2. **Ownership Conflicts**: MFEM often manages or aliases the memory, making conversion unsafe
+3. **Dangling Pointers**: Conversion would invalidate MFEM's pointers to HYPRE data
+4. **Not the Primary Use Case**: Mixed-precision is designed for preconditioners, not data conversion
 
-   // Convert to single precision storage
-   x.ConvertToSingle();
-
-   // Convert back to double precision
-   x.ConvertToDouble();
-#endif
-```
-
-**Note:** Data loss may occur when converting from double to single precision.
-
-### HypreParMatrix
-
-Convert matrix storage between precisions:
-
-```cpp
-#ifdef HYPRE_MIXED_PRECISION
-   HypreParMatrix A(comm, ...);
-
-   // Convert to single precision storage
-   A.ConvertToSingle();
-
-   // Convert back to double precision
-   A.ConvertToDouble();
-#endif
-```
+The safe and recommended approach is to set precision **before** HYPRE allocates memory,
+which is exactly what `HypreBoomerAMG::SetPrecision()` does.
 
 ## Example: Mixed-Precision PCG Solve
 
@@ -123,9 +102,13 @@ Convert matrix storage between precisions:
 
 ## Implementation Notes
 
-The MFEM multi-precision support provides thin wrappers around HYPRE's multi-precision API:
-- `HYPRE_BoomerAMGSetPrecision()`
+The MFEM multi-precision support provides a safe wrapper around HYPRE's multi-precision API:
+- `HYPRE_BoomerAMGSetPrecision()` - Safe: sets precision before memory allocation
+
+**Not Exposed** (due to memory safety concerns with MFEM's memory management):
 - `HYPRE_ParVectorConvertToSingle()` / `HYPRE_ParVectorConvertToDouble()`
 - `HYPRE_ParCSRMatrixConvertToSingle()` / `HYPRE_ParCSRMatrixConvertToDouble()`
 
-These functions are only declared when HYPRE is built with `--enable-mixed-precision`.
+These conversion functions reallocate HYPRE's internal memory, which would invalidate
+MFEM's pointers and violate ownership assumptions. The recommended approach is to set
+precision before HYPRE creates its internal data structures, not convert them afterward.

@@ -65,21 +65,23 @@ int main(int argc, char *argv[])
       cout << "  - AMG operations are faster on modern hardware" << endl;
       cout << "  - Outer CG solver maintains full double precision" << endl;
       cout << "  - Overall accuracy determined by outer solver tolerance" << endl;
-      cout << "\nBest for: Large problems where AMG memory is significant\n" << endl;
+      cout << "\nBest for: Large problems where AMG memory is significant" << endl;
+      cout << "\nIMPORTANT: Set precision BEFORE setup, not after!" << endl;
+      cout << "HYPRE allocates structures in the requested precision.\n" << endl;
    }
 
-   // Example 2: Converting existing vectors/matrices
-   // ===============================================
+   // Example 2: Why No Vector/Matrix Conversion?
+   // ===========================================
 
-   // HypreParVector v(comm, global_size, col);
-   // v.ConvertToSingle();   // Convert to single precision
-   // ... use in single-precision operations ...
-   // v.ConvertToDouble();   // Convert back to double
-
-   // HypreParMatrix M(comm, ...);
-   // M.ConvertToSingle();   // Convert to single precision
-   // ... use in single-precision operations ...
-   // M.ConvertToDouble();   // Convert back to double
+   if (myid == 0)
+   {
+      cout << "Note: MFEM does NOT provide ConvertToSingle/Double() for vectors/matrices" << endl;
+      cout << "Reason: HYPRE conversion reallocates memory, which would:" << endl;
+      cout << "  - Invalidate MFEM's pointers to HYPRE data" << endl;
+      cout << "  - Cause ownership conflicts and potential crashes" << endl;
+      cout << "  - Create dangling pointer bugs" << endl;
+      cout << "\nThe safe approach: Set preconditioner precision BEFORE setup!\n" << endl;
+   }
 
    if (myid == 0)
    {

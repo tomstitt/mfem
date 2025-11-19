@@ -400,31 +400,6 @@ public:
    /// Reads a HypreParVector from files saved with HypreParVector::Print
    void Read(MPI_Comm comm, const std::string &fname);
 
-#ifdef HYPRE_MIXED_PRECISION
-   /** @brief Convert the vector to use single precision storage.
-    *
-    *  When hypre is built with mixed-precision support (--enable-mixed-precision),
-    *  this function converts the vector's internal storage to single precision.
-    *  This is useful for reducing memory footprint and improving performance in
-    *  mixed-precision solvers.
-    *
-    *  @note This function requires hypre to be built with --enable-mixed-precision.
-    *  @note Data loss may occur when converting from double to single precision.
-    */
-   void ConvertToSingle()
-   { HYPRE_ParVectorConvertToSingle(x); }
-
-   /** @brief Convert the vector to use double precision storage.
-    *
-    *  When hypre is built with mixed-precision support (--enable-mixed-precision),
-    *  this function converts the vector's internal storage to double precision.
-    *
-    *  @note This function requires hypre to be built with --enable-mixed-precision.
-    */
-   void ConvertToDouble()
-   { HYPRE_ParVectorConvertToDouble(x); }
-#endif
-
    /// Calls hypre's destroy function
    ~HypreParVector();
 };
@@ -1006,31 +981,6 @@ public:
    /// @brief Return the Frobenius norm of the matrix (or 0 if the underlying
    /// hypre matrix is NULL)
    real_t FNorm() const;
-
-#ifdef HYPRE_MIXED_PRECISION
-   /** @brief Convert the matrix to use single precision storage.
-    *
-    *  When hypre is built with mixed-precision support (--enable-mixed-precision),
-    *  this function converts the matrix's internal storage to single precision.
-    *  This is useful for reducing memory footprint and improving performance in
-    *  mixed-precision solvers.
-    *
-    *  @note This function requires hypre to be built with --enable-mixed-precision.
-    *  @note Data loss may occur when converting from double to single precision.
-    */
-   void ConvertToSingle()
-   { HYPRE_ParCSRMatrixConvertToSingle(A); }
-
-   /** @brief Convert the matrix to use double precision storage.
-    *
-    *  When hypre is built with mixed-precision support (--enable-mixed-precision),
-    *  this function converts the matrix's internal storage to double precision.
-    *
-    *  @note This function requires hypre to be built with --enable-mixed-precision.
-    */
-   void ConvertToDouble()
-   { HYPRE_ParCSRMatrixConvertToDouble(A); }
-#endif
 
    /// Calls hypre's destroy function
    virtual ~HypreParMatrix() { Destroy(); }
