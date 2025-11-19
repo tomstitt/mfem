@@ -44,6 +44,10 @@
 //               mpirun -np 4 ex1p -pa -d ceed-cuda:/gpu/cuda/shared -m ../data/fichera-mixed.mesh
 //               mpirun -np 4 ex1p -m ../data/beam-tet.mesh -pa -d ceed-cpu
 //
+// Mixed-precision sample runs (requires hypre built with --enable-mixed-precision):
+//               mpirun -np 4 ex1p -m ../data/square-disc.mesh -amg-sp
+//               mpirun -np 4 ex1p -m ../data/fichera.mesh -o 2 -amg-sp
+//
 // Description:  This example code demonstrates the use of MFEM to define a
 //               simple finite element discretization of the Poisson problem
 //               -Delta u = 1 with homogeneous Dirichlet boundary conditions.
@@ -58,6 +62,12 @@
 //               discrete linear system. We also cover the explicit elimination
 //               of essential boundary conditions, static condensation, and the
 //               optional connection to the GLVis tool for visualization.
+//
+//               When hypre is built with multi-precision support, this example
+//               demonstrates mixed-precision solves: using a single-precision
+//               AMG preconditioner within a double-precision CG solver via the
+//               -amg-sp flag. This can reduce memory usage and improve
+//               performance while maintaining accuracy.
 
 #include "mfem.hpp"
 #include <fstream>
@@ -83,6 +93,7 @@ int main(int argc, char *argv[])
    const char *device_config = "cpu";
    bool visualization = true;
    bool algebraic_ceed = false;
+   bool amg_single_precision = false;
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -102,6 +113,12 @@ int main(int argc, char *argv[])
    args.AddOption(&algebraic_ceed, "-a", "--algebraic",
                   "-no-a", "--no-algebraic",
                   "Use algebraic Ceed solver");
+#endif
+#ifdef HYPRE_MIXED_PRECISION
+   args.AddOption(&amg_single_precision, "-amg-sp", "--amg-single-precision",
+                  "-no-amg-sp", "--no-amg-single-precision",
+                  "Enable single-precision AMG preconditioner (requires HYPRE "
+                  "built with --enable-mixed-precision).");
 #endif
    args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
                   "--no-visualization",
@@ -265,7 +282,22 @@ int main(int argc, char *argv[])
    }
    else
    {
-      prec = new HypreBoomerAMG;
+      HypreBoomerAMG *amg = new HypreBoomerAMG;
+#ifdef HYPRE_MIXED_PRECISION
+      // Enable mixed-precision: use single-precision AMG preconditioner
+      // operations within the double-precision CG solver for improved
+      // performance while maintaining accuracy in the outer solver.
+      if (amg_single_precision)
+      {
+         amg->SetPrecision(1);  // 1 = single precision, 0 = double (default)
+         if (myid == 0)
+         {
+            cout << "Using single-precision AMG preconditioner with "
+                 << "double-precision CG solver" << endl;
+         }
+      }
+#endif
+      prec = amg;
    }
    CGSolver cg(MPI_COMM_WORLD);
    cg.SetRelTol(1e-12);
