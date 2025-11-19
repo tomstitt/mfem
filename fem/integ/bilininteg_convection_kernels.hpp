@@ -17,6 +17,7 @@
 #include "../gridfunc.hpp"
 #include "../qfunction.hpp"
 #include "../ceed/integrators/convection/convection.hpp"
+#include "tile_abstraction.hpp"
 
 /// \cond DO_NOT_DOCUMENT
 namespace mfem
@@ -450,7 +451,7 @@ void PAConvectionApply3D(const int ne,
    });
 }
 
-// Optimized PA Convection Apply 3D kernel
+// Optimized PA Convection Apply 3D kernel - refactored with tile abstraction
 template<int T_D1D = 0, int T_Q1D = 0> static
 void SmemPAConvectionApply3D(const int ne,
                              const Array<real_t> &b,
@@ -482,6 +483,12 @@ void SmemPAConvectionApply3D(const int ne,
       constexpr int max_D1D = T_D1D ? T_D1D : DofQuadLimits::MAX_D1D;
       constexpr int max_Q1D = T_Q1D ? T_Q1D : DofQuadLimits::MAX_Q1D;
       constexpr int max_DQ = (max_Q1D > max_D1D) ? max_Q1D : max_D1D;
+
+      // Create tile objects for different spaces
+      tile3d::Tile<max_D1D, max_D1D, max_D1D> dof_tile(D1D, D1D, D1D);
+      tile3d::Tile<max_Q1D, max_Q1D, max_Q1D> quad_tile(Q1D, Q1D, Q1D);
+
+      // Shared memory allocation
       MFEM_SHARED real_t sm0[max_DQ*max_DQ*max_DQ];
       MFEM_SHARED real_t sm1[max_DQ*max_DQ*max_DQ];
       MFEM_SHARED real_t sm2[max_DQ*max_DQ*max_DQ];
@@ -490,167 +497,140 @@ void SmemPAConvectionApply3D(const int ne,
       MFEM_SHARED real_t sm5[max_DQ*max_DQ*max_DQ];
 
       real_t (*u)[max_D1D][max_D1D] = (real_t (*)[max_D1D][max_D1D]) sm0;
-      MFEM_FOREACH_THREAD(dz,z,D1D)
+
+      // Load input using tile abstraction (non-direct for convection)
+      tile3d::MixedTile<max_D1D, max_D1D, max_D1D> load_tile(D1D, D1D, D1D);
+      load_tile.forEachNonDirect([&](int dx, int dy, int dz)
       {
-         MFEM_FOREACH_THREAD(dy,y,D1D)
-         {
-            MFEM_FOREACH_THREAD(dx,x,D1D)
-            {
-               u[dz][dy][dx] = x(dx,dy,dz,e);
-            }
-         }
-      }
+         u[dz][dy][dx] = x(dx,dy,dz,e);
+      });
       MFEM_SYNC_THREAD;
+
+      // Forward pass Step 1: Contract along X (D->Q in X)
       real_t (*Bu)[max_D1D][max_Q1D] = (real_t (*)[max_D1D][max_Q1D])sm1;
       real_t (*Gu)[max_D1D][max_Q1D] = (real_t (*)[max_D1D][max_Q1D])sm2;
-      MFEM_FOREACH_THREAD(dz,z,D1D)
+      tile3d::MixedTile<max_Q1D, max_D1D, max_D1D> ddq_tile(Q1D, D1D, D1D);
+      ddq_tile.forEachNonDirect([&](int qx, int dy, int dz)
       {
-         MFEM_FOREACH_THREAD(dy,y,D1D)
+         real_t Bu_ = 0.0;
+         real_t Gu_ = 0.0;
+         for (int dx = 0; dx < D1D; ++dx)
          {
-            MFEM_FOREACH_THREAD(qx,x,Q1D)
-            {
-               real_t Bu_ = 0.0;
-               real_t Gu_ = 0.0;
-               for (int dx = 0; dx < D1D; ++dx)
-               {
-                  const real_t bx = B(qx,dx);
-                  const real_t gx = G(qx,dx);
-                  const real_t x = u[dz][dy][dx];
-                  Bu_ += bx * x;
-                  Gu_ += gx * x;
-               }
-               Bu[dz][dy][qx] = Bu_;
-               Gu[dz][dy][qx] = Gu_;
-            }
+            const real_t bx = B(qx,dx);
+            const real_t gx = G(qx,dx);
+            const real_t val = u[dz][dy][dx];
+            Bu_ += bx * val;
+            Gu_ += gx * val;
          }
-      }
+         Bu[dz][dy][qx] = Bu_;
+         Gu[dz][dy][qx] = Gu_;
+      });
       MFEM_SYNC_THREAD;
+
+      // Forward pass Step 2: Contract along Y (D->Q in Y)
       real_t (*BBu)[max_Q1D][max_Q1D] = (real_t (*)[max_Q1D][max_Q1D])sm3;
       real_t (*GBu)[max_Q1D][max_Q1D] = (real_t (*)[max_Q1D][max_Q1D])sm4;
       real_t (*BGu)[max_Q1D][max_Q1D] = (real_t (*)[max_Q1D][max_Q1D])sm5;
-      MFEM_FOREACH_THREAD(dz,z,D1D)
+      tile3d::MixedTile<max_Q1D, max_Q1D, max_D1D> dqq_tile(Q1D, Q1D, D1D);
+      dqq_tile.forEachNonDirect([&](int qx, int qy, int dz)
       {
-         MFEM_FOREACH_THREAD(qx,x,Q1D)
+         real_t BBu_ = 0.0;
+         real_t GBu_ = 0.0;
+         real_t BGu_ = 0.0;
+         for (int dy = 0; dy < D1D; ++dy)
          {
-            MFEM_FOREACH_THREAD(qy,y,Q1D)
-            {
-               real_t BBu_ = 0.0;
-               real_t GBu_ = 0.0;
-               real_t BGu_ = 0.0;
-               for (int dy = 0; dy < D1D; ++dy)
-               {
-                  const real_t bx = B(qy,dy);
-                  const real_t gx = G(qy,dy);
-                  BBu_ += bx * Bu[dz][dy][qx];
-                  GBu_ += gx * Bu[dz][dy][qx];
-                  BGu_ += bx * Gu[dz][dy][qx];
-               }
-               BBu[dz][qy][qx] = BBu_;
-               GBu[dz][qy][qx] = GBu_;
-               BGu[dz][qy][qx] = BGu_;
-            }
+            const real_t by = B(qy,dy);
+            const real_t gy = G(qy,dy);
+            BBu_ += by * Bu[dz][dy][qx];
+            GBu_ += gy * Bu[dz][dy][qx];
+            BGu_ += by * Gu[dz][dy][qx];
          }
-      }
+         BBu[dz][qy][qx] = BBu_;
+         GBu[dz][qy][qx] = GBu_;
+         BGu[dz][qy][qx] = BGu_;
+      });
       MFEM_SYNC_THREAD;
+
+      // Forward pass Step 3: Contract along Z (D->Q in Z) - compute gradients
       real_t (*GBBu)[max_Q1D][max_Q1D] = (real_t (*)[max_Q1D][max_Q1D])sm0;
       real_t (*BGBu)[max_Q1D][max_Q1D] = (real_t (*)[max_Q1D][max_Q1D])sm1;
       real_t (*BBGu)[max_Q1D][max_Q1D] = (real_t (*)[max_Q1D][max_Q1D])sm2;
-      MFEM_FOREACH_THREAD(qx,x,Q1D)
+      quad_tile.forXYZ([&](int qx, int qy, int qz)
       {
-         MFEM_FOREACH_THREAD(qy,y,Q1D)
+         real_t GBBu_ = 0.0;  // Gradient in Z direction
+         real_t BGBu_ = 0.0;  // Gradient in Y direction
+         real_t BBGu_ = 0.0;  // Gradient in X direction
+         for (int dz = 0; dz < D1D; ++dz)
          {
-            MFEM_FOREACH_THREAD(qz,z,Q1D)
-            {
-               real_t GBBu_ = 0.0;
-               real_t BGBu_ = 0.0;
-               real_t BBGu_ = 0.0;
-               for (int dz = 0; dz < D1D; ++dz)
-               {
-                  const real_t bx = B(qz,dz);
-                  const real_t gx = G(qz,dz);
-                  GBBu_ += gx * BBu[dz][qy][qx];
-                  BGBu_ += bx * GBu[dz][qy][qx];
-                  BBGu_ += bx * BGu[dz][qy][qx];
-               }
-               GBBu[qz][qy][qx] = GBBu_;
-               BGBu[qz][qy][qx] = BGBu_;
-               BBGu[qz][qy][qx] = BBGu_;
-            }
+            const real_t bz = B(qz,dz);
+            const real_t gz = G(qz,dz);
+            GBBu_ += gz * BBu[dz][qy][qx];
+            BGBu_ += bz * GBu[dz][qy][qx];
+            BBGu_ += bz * BGu[dz][qy][qx];
          }
-      }
+         GBBu[qz][qy][qx] = GBBu_;
+         BGBu[qz][qy][qx] = BGBu_;
+         BBGu[qz][qy][qx] = BBGu_;
+      });
       MFEM_SYNC_THREAD;
+
+      // Apply convection operator (v · ∇u)
       real_t (*DGu)[max_Q1D][max_Q1D] = (real_t (*)[max_Q1D][max_Q1D])sm3;
-      MFEM_FOREACH_THREAD(qz,z,Q1D)
+      quad_tile.forXYZ([&](int qx, int qy, int qz)
       {
-         MFEM_FOREACH_THREAD(qy,y,Q1D)
-         {
-            MFEM_FOREACH_THREAD(qx,x,Q1D)
-            {
-               const real_t O1 = op(qx,qy,qz,0,e);
-               const real_t O2 = op(qx,qy,qz,1,e);
-               const real_t O3 = op(qx,qy,qz,2,e);
+         const real_t O1 = op(qx,qy,qz,0,e);  // Velocity component x
+         const real_t O2 = op(qx,qy,qz,1,e);  // Velocity component y
+         const real_t O3 = op(qx,qy,qz,2,e);  // Velocity component z
 
-               const real_t gradX = BBGu[qz][qy][qx];
-               const real_t gradY = BGBu[qz][qy][qx];
-               const real_t gradZ = GBBu[qz][qy][qx];
+         const real_t gradX = BBGu[qz][qy][qx];
+         const real_t gradY = BGBu[qz][qy][qx];
+         const real_t gradZ = GBBu[qz][qy][qx];
 
-               DGu[qz][qy][qx] = (O1 * gradX) + (O2 * gradY) + (O3 * gradZ);
-            }
-         }
-      }
+         DGu[qz][qy][qx] = (O1 * gradX) + (O2 * gradY) + (O3 * gradZ);
+      });
       MFEM_SYNC_THREAD;
+
+      // Backward pass Step 1: Contract along Z (Q->D in Z)
       real_t (*BDGu)[max_Q1D][max_Q1D] = (real_t (*)[max_Q1D][max_Q1D])sm4;
-      MFEM_FOREACH_THREAD(qx,x,Q1D)
+      tile3d::MixedTile<max_Q1D, max_Q1D, max_D1D> qqd_tile(Q1D, Q1D, D1D);
+      qqd_tile.forEachNonDirect([&](int qx, int qy, int dz)
       {
-         MFEM_FOREACH_THREAD(qy,y,Q1D)
+         real_t BDGu_ = 0.0;
+         for (int qz = 0; qz < Q1D; ++qz)
          {
-            MFEM_FOREACH_THREAD(dz,z,D1D)
-            {
-               real_t BDGu_ = 0.0;
-               for (int qz = 0; qz < Q1D; ++qz)
-               {
-                  const real_t w = Bt(dz,qz);
-                  BDGu_ += w * DGu[qz][qy][qx];
-               }
-               BDGu[dz][qy][qx] = BDGu_;
-            }
+            const real_t w = Bt(dz,qz);
+            BDGu_ += w * DGu[qz][qy][qx];
          }
-      }
+         BDGu[dz][qy][qx] = BDGu_;
+      });
       MFEM_SYNC_THREAD;
+
+      // Backward pass Step 2: Contract along Y (Q->D in Y)
       real_t (*BBDGu)[max_D1D][max_Q1D] = (real_t (*)[max_D1D][max_Q1D])sm5;
-      MFEM_FOREACH_THREAD(dz,z,D1D)
+      tile3d::MixedTile<max_Q1D, max_D1D, max_D1D> qdq_tile(Q1D, D1D, D1D);
+      qdq_tile.forEachNonDirect([&](int qx, int dy, int dz)
       {
-         MFEM_FOREACH_THREAD(qx,x,Q1D)
+         real_t BBDGu_ = 0.0;
+         for (int qy = 0; qy < Q1D; ++qy)
          {
-            MFEM_FOREACH_THREAD(dy,y,D1D)
-            {
-               real_t BBDGu_ = 0.0;
-               for (int qy = 0; qy < Q1D; ++qy)
-               {
-                  const real_t w = Bt(dy,qy);
-                  BBDGu_ += w * BDGu[dz][qy][qx];
-               }
-               BBDGu[dz][dy][qx] = BBDGu_;
-            }
+            const real_t w = Bt(dy,qy);
+            BBDGu_ += w * BDGu[dz][qy][qx];
          }
-      }
+         BBDGu[dz][dy][qx] = BBDGu_;
+      });
       MFEM_SYNC_THREAD;
-      MFEM_FOREACH_THREAD(dz,z,D1D)
+
+      // Backward pass Step 3: Contract along X (Q->D in X) and accumulate
+      dof_tile.forXYZ([&](int dx, int dy, int dz)
       {
-         MFEM_FOREACH_THREAD(dy,y,D1D)
+         real_t BBBDGu = 0.0;
+         for (int qx = 0; qx < Q1D; ++qx)
          {
-            MFEM_FOREACH_THREAD(dx,x,D1D)
-            {
-               real_t BBBDGu = 0.0;
-               for (int qx = 0; qx < Q1D; ++qx)
-               {
-                  const real_t w = Bt(dx,qx);
-                  BBBDGu += w * BBDGu[dz][dy][qx];
-               }
-               y(dx,dy,dz,e) += BBBDGu;
-            }
+            const real_t w = Bt(dx,qx);
+            BBBDGu += w * BBDGu[dz][dy][qx];
          }
-      }
+         y(dx,dy,dz,e) += BBBDGu;
+      });
    });
 }
 

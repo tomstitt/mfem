@@ -19,6 +19,7 @@
 #include "../../linalg/dtensor.hpp"
 #include "../../linalg/vector.hpp"
 #include "../bilininteg.hpp"
+#include "tile_abstraction.hpp"
 
 namespace mfem
 {
@@ -983,91 +984,6 @@ inline void PADiffusionApply3D(const int NE,
       }
    });
 }
-
-// Tile abstraction for 3D thread blocks
-// Encapsulates thread iteration patterns for 3D data
-namespace tile3d
-{
-
-// Represents threading dimensions for a 3D tile
-template<int MX, int MY, int MZ>
-struct Tile
-{
-   int nx, ny, nz;  // Runtime dimensions
-
-   MFEM_HOST_DEVICE Tile(int x, int y, int z) : nx(x), ny(y), nz(z) {}
-
-   // Load a 3D tile from global memory using this tile's threading pattern
-   template<typename SrcView, typename DstArray>
-   MFEM_HOST_DEVICE void load(const SrcView &src, DstArray &dst, int elem) const
-   {
-      MFEM_FOREACH_THREAD_DIRECT(iz,z,nz)
-      {
-         MFEM_FOREACH_THREAD_DIRECT(iy,y,ny)
-         {
-            MFEM_FOREACH_THREAD_DIRECT(ix,x,nx)
-            {
-               dst[iz][iy][ix] = src(ix,iy,iz,elem);
-            }
-         }
-      }
-   }
-
-   // Execute a lambda for each thread in this tile's X-Y plane at given Z
-   template<typename Lambda>
-   MFEM_HOST_DEVICE void forXY(Lambda&& func) const
-   {
-      MFEM_FOREACH_THREAD_DIRECT(iy,y,ny)
-      {
-         MFEM_FOREACH_THREAD_DIRECT(ix,x,nx)
-         {
-            func(ix, iy);
-         }
-      }
-   }
-
-   // Execute a lambda for each thread in this tile
-   template<typename Lambda>
-   MFEM_HOST_DEVICE void forXYZ(Lambda&& func) const
-   {
-      MFEM_FOREACH_THREAD_DIRECT(iz,z,nz)
-      {
-         MFEM_FOREACH_THREAD_DIRECT(iy,y,ny)
-         {
-            MFEM_FOREACH_THREAD_DIRECT(ix,x,nx)
-            {
-               func(ix, iy, iz);
-            }
-         }
-      }
-   }
-};
-
-// Helper to create a mixed-dimension tile (e.g., D x D x Q)
-template<int MX, int MY, int MZ>
-struct MixedTile
-{
-   int nx, ny, nz;
-
-   MFEM_HOST_DEVICE MixedTile(int x, int y, int z) : nx(x), ny(y), nz(z) {}
-
-   template<typename Lambda>
-   MFEM_HOST_DEVICE void forEach(Lambda&& func) const
-   {
-      MFEM_FOREACH_THREAD_DIRECT(iz,z,nz)
-      {
-         MFEM_FOREACH_THREAD_DIRECT(iy,y,ny)
-         {
-            MFEM_FOREACH_THREAD_DIRECT(ix,x,nx)
-            {
-               func(ix, iy, iz);
-            }
-         }
-      }
-   }
-};
-
-} // namespace tile3d
 
 // Shared memory PA Diffusion Apply 3D kernel - refactored with tile abstraction
 template<int T_D1D = 0, int T_Q1D = 0>
