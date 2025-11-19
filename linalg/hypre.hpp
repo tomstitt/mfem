@@ -400,6 +400,31 @@ public:
    /// Reads a HypreParVector from files saved with HypreParVector::Print
    void Read(MPI_Comm comm, const std::string &fname);
 
+#ifdef HYPRE_MIXED_PRECISION
+   /** @brief Convert the vector to use single precision storage.
+    *
+    *  When hypre is built with mixed-precision support (--enable-mixed-precision),
+    *  this function converts the vector's internal storage to single precision.
+    *  This is useful for reducing memory footprint and improving performance in
+    *  mixed-precision solvers.
+    *
+    *  @note This function requires hypre to be built with --enable-mixed-precision.
+    *  @note Data loss may occur when converting from double to single precision.
+    */
+   void ConvertToSingle()
+   { HYPRE_ParVectorConvertToSingle(x); }
+
+   /** @brief Convert the vector to use double precision storage.
+    *
+    *  When hypre is built with mixed-precision support (--enable-mixed-precision),
+    *  this function converts the vector's internal storage to double precision.
+    *
+    *  @note This function requires hypre to be built with --enable-mixed-precision.
+    */
+   void ConvertToDouble()
+   { HYPRE_ParVectorConvertToDouble(x); }
+#endif
+
    /// Calls hypre's destroy function
    ~HypreParVector();
 };
@@ -981,6 +1006,31 @@ public:
    /// @brief Return the Frobenius norm of the matrix (or 0 if the underlying
    /// hypre matrix is NULL)
    real_t FNorm() const;
+
+#ifdef HYPRE_MIXED_PRECISION
+   /** @brief Convert the matrix to use single precision storage.
+    *
+    *  When hypre is built with mixed-precision support (--enable-mixed-precision),
+    *  this function converts the matrix's internal storage to single precision.
+    *  This is useful for reducing memory footprint and improving performance in
+    *  mixed-precision solvers.
+    *
+    *  @note This function requires hypre to be built with --enable-mixed-precision.
+    *  @note Data loss may occur when converting from double to single precision.
+    */
+   void ConvertToSingle()
+   { HYPRE_ParCSRMatrixConvertToSingle(A); }
+
+   /** @brief Convert the matrix to use double precision storage.
+    *
+    *  When hypre is built with mixed-precision support (--enable-mixed-precision),
+    *  this function converts the matrix's internal storage to double precision.
+    *
+    *  @note This function requires hypre to be built with --enable-mixed-precision.
+    */
+   void ConvertToDouble()
+   { HYPRE_ParCSRMatrixConvertToDouble(A); }
+#endif
 
    /// Calls hypre's destroy function
    virtual ~HypreParMatrix() { Destroy(); }
@@ -1865,6 +1915,28 @@ public:
    /// Expert option - consult hypre documentation/team
    void SetAggressiveCoarsening(int num_levels)
    { HYPRE_BoomerAMGSetAggNumLevels(amg_precond, num_levels); }
+
+#ifdef HYPRE_MIXED_PRECISION
+   /** @brief Enable mixed-precision solve for BoomerAMG.
+    *
+    *  When hypre is built with mixed-precision support (--enable-mixed-precision),
+    *  this function enables the use of a lower-precision AMG preconditioner
+    *  (e.g., single precision) within a higher-precision Krylov solver
+    *  (e.g., double precision). This can improve performance while maintaining
+    *  accuracy in the overall solve.
+    *
+    *  @param precision The precision level to use for AMG operations.
+    *                   Valid options (hypre version dependent):
+    *                   - 0 or "double": Use double precision (default)
+    *                   - 1 or "single": Use single precision
+    *
+    *  @note This function requires hypre to be built with --enable-mixed-precision.
+    *  @note The outer Krylov solver precision is determined by MFEM's real_t type.
+    *  @note See hypre documentation for details on mixed-precision support.
+    */
+   void SetPrecision(int precision)
+   { HYPRE_BoomerAMGSetPrecision(amg_precond, precision); }
+#endif
 
    /// The typecast to HYPRE_Solver returns the internal amg_precond
    operator HYPRE_Solver() const override { return amg_precond; }
