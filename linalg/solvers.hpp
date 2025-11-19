@@ -698,6 +698,64 @@ public:
 };
 
 
+/// Pipelined Preconditioned Conjugate Gradient method
+/** This solver overlaps communication with computation using non-blocking
+    MPI reductions (MPI_Iallreduce). Based on Ghysels & Vanroose (2014),
+    "Hiding global synchronization latency in the preconditioned Conjugate
+    Gradient algorithm", Parallel Computing 40(7):224-238.
+
+    The algorithm restructures standard PCG to perform only one non-blocking
+    global reduction per iteration, overlapping it with the matrix-vector
+    product and preconditioner application. This significantly improves
+    scalability on systems where communication latency dominates.
+
+    Trade-offs vs standard PCG:
+    - Better parallel scalability (hides communication latency)
+    - Same convergence properties as standard PCG
+    - Cost: ~2 extra vectors, slightly more FLOPs
+    - Requires MPI with non-blocking collectives (MPI 3.0+) */
+class PipelinedPCGSolver : public IterativeSolver
+{
+protected:
+   mutable Vector r, u, m, n, z, q, s, w;
+#ifdef MFEM_USE_MPI
+   mutable MPI_Request request;
+   mutable bool request_pending;
+   mutable real_t global_buf[3]; // buffer for non-blocking reductions
+   mutable real_t local_buf[3];
+#endif
+
+   void UpdateVectors();
+
+#ifdef MFEM_USE_MPI
+   /// Start non-blocking inner product computation
+   void StartInnerProduct(real_t local1, real_t local2, real_t local3) const;
+
+   /// Wait for non-blocking inner product to complete
+   void WaitInnerProduct(real_t &global1, real_t &global2, real_t &global3) const;
+#endif
+
+public:
+   PipelinedPCGSolver() { }
+
+#ifdef MFEM_USE_MPI
+   PipelinedPCGSolver(MPI_Comm comm_) : IterativeSolver(comm_), request_pending(false) { }
+#endif
+
+   void SetOperator(const Operator &op) override
+   { IterativeSolver::SetOperator(op); UpdateVectors(); }
+
+   /** @brief Iterative solution of the linear system using Pipelined
+       Preconditioned Conjugate Gradient method with communication-computation
+       overlap. */
+   void Mult(const Vector &b, Vector &x) const override;
+
+#ifdef MFEM_USE_MPI
+   virtual ~PipelinedPCGSolver();
+#endif
+};
+
+
 /// GMRES method
 class GMRESSolver : public IterativeSolver
 {

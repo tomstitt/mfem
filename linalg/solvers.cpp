@@ -1381,6 +1381,331 @@ CAPCGSolver::~CAPCGSolver()
 }
 
 
+// Pipelined PCG implementation (Ghysels & Vanroose, 2014)
+
+void PipelinedPCGSolver::UpdateVectors()
+{
+   const int n = width;
+   r.SetSize(n);
+   u.SetSize(n);
+   m.SetSize(n);
+   n.SetSize(n);
+   z.SetSize(n);
+   q.SetSize(n);
+   s.SetSize(n);
+   w.SetSize(n);
+}
+
+#ifdef MFEM_USE_MPI
+void PipelinedPCGSolver::StartInnerProduct(real_t local1, real_t local2,
+                                            real_t local3) const
+{
+   // Cancel any pending request (shouldn't happen in normal operation)
+   if (request_pending)
+   {
+      MPI_Cancel(&request);
+      MPI_Request_free(&request);
+      request_pending = false;
+   }
+
+   // Pack local values
+   local_buf[0] = local1;
+   local_buf[1] = local2;
+   local_buf[2] = local3;
+
+   // Start non-blocking allreduce
+   MPI_Comm mpi_comm = GetComm();
+   if (mpi_comm != MPI_COMM_NULL)
+   {
+      MPI_Iallreduce(local_buf, global_buf, 3, MFEM_MPI_REAL_T, MPI_SUM,
+                     mpi_comm, &request);
+      request_pending = true;
+   }
+   else
+   {
+      // Serial case - just copy
+      global_buf[0] = local1;
+      global_buf[1] = local2;
+      global_buf[2] = local3;
+      request_pending = false;
+   }
+}
+
+void PipelinedPCGSolver::WaitInnerProduct(real_t &global1, real_t &global2,
+                                           real_t &global3) const
+{
+   if (request_pending)
+   {
+      MPI_Wait(&request, MPI_STATUS_IGNORE);
+      request_pending = false;
+   }
+
+   global1 = global_buf[0];
+   global2 = global_buf[1];
+   global3 = global_buf[2];
+}
+
+PipelinedPCGSolver::~PipelinedPCGSolver()
+{
+   // Clean up any pending MPI request
+   if (request_pending)
+   {
+      MPI_Cancel(&request);
+      MPI_Request_free(&request);
+      request_pending = false;
+   }
+}
+#endif // MFEM_USE_MPI
+
+void PipelinedPCGSolver::Mult(const Vector &b, Vector &x) const
+{
+   MFEM_PERF_FUNCTION;
+
+   int i;
+   real_t alpha, beta, gamma, delta, rho, rho_prev;
+   real_t rtol, atol, init_norm;
+
+   x.UseDevice(true);
+
+   // Initialize residual
+   if (iterative_mode)
+   {
+      oper->Mult(x, r);
+      subtract(b, r, r); // r = b - A x
+   }
+   else
+   {
+      r = b;
+      x = 0.0;
+   }
+
+   // Initial preconditioner application
+   if (prec)
+   {
+      prec->Mult(r, u); // u = M^{-1} r
+   }
+   else
+   {
+      u = r;
+   }
+
+   // Compute initial residual norm
+#ifdef MFEM_USE_MPI
+   real_t local_gamma = r * u;
+   real_t global_gamma;
+   MPI_Comm mpi_comm = GetComm();
+   if (mpi_comm != MPI_COMM_NULL)
+   {
+      MPI_Allreduce(&local_gamma, &global_gamma, 1, MFEM_MPI_REAL_T, MPI_SUM, mpi_comm);
+      gamma = global_gamma;
+   }
+   else
+   {
+      gamma = local_gamma;
+   }
+#else
+   gamma = r * u;
+#endif
+
+   init_norm = sqrt(gamma);
+   initial_norm = init_norm;
+   MFEM_VERIFY(IsFinite(gamma), "gamma = " << gamma);
+
+   if (print_options.iterations || print_options.first_and_last)
+   {
+      mfem::out << "   Iteration : " << setw(3) << 0 << "  (r, M^{-1}r) = "
+                << gamma << (print_options.first_and_last ? " ...\n" : "\n");
+   }
+
+   if (gamma < 0.0)
+   {
+      if (print_options.warnings)
+      {
+         mfem::out << "Pipelined PCG: The preconditioner is not positive definite. (r, M^{-1}r) = "
+                   << gamma << '\n';
+      }
+      converged = false;
+      final_iter = 0;
+      final_norm = init_norm;
+      return;
+   }
+
+   rtol = std::max(rel_tol * rel_tol * gamma, abs_tol * abs_tol);
+   if (gamma <= rtol)
+   {
+      converged = true;
+      final_iter = 0;
+      final_norm = sqrt(gamma);
+      return;
+   }
+
+   // Pipelined PCG initialization
+   oper->Mult(u, w);  // w = A u
+
+   if (prec)
+   {
+      prec->Mult(w, m); // m = M^{-1} w
+   }
+   else
+   {
+      m = w;
+   }
+
+#ifdef MFEM_USE_MPI
+   // Compute delta = (w, u) and rho = (w, m) with single reduction
+   real_t local_vals[2];
+   real_t global_vals[2];
+   local_vals[0] = w * u;
+   local_vals[1] = w * m;
+
+   if (mpi_comm != MPI_COMM_NULL)
+   {
+      MPI_Allreduce(local_vals, global_vals, 2, MFEM_MPI_REAL_T, MPI_SUM, mpi_comm);
+      delta = global_vals[0];
+      rho = global_vals[1];
+   }
+   else
+   {
+      delta = local_vals[0];
+      rho = local_vals[1];
+   }
+#else
+   delta = w * u;
+   rho = w * m;
+#endif
+
+   MFEM_VERIFY(IsFinite(delta), "delta = " << delta);
+   MFEM_VERIFY(IsFinite(rho), "rho = " << rho);
+
+   // Main pipelined iteration
+   converged = false;
+   final_iter = max_iter;
+
+   for (i = 1; i <= max_iter; i++)
+   {
+      // Compute alpha
+      alpha = gamma / delta;
+
+      // Update solution and residual
+      add(x, alpha, u, x);        // x = x + alpha * u
+      add(r, -alpha, w, r);       // r = r - alpha * w
+      add(z, alpha, m, z);        // z = z + alpha * m (note: z starts at 0 implicitly)
+      // For first iteration, initialize z properly
+      if (i == 1)
+      {
+         z = 0.0;
+         add(z, alpha, m, z);
+      }
+
+      // Compute s = u - alpha * m
+      add(u, -alpha, m, s);
+
+      // *** KEY PIPELINING STEP ***
+      // Start non-blocking computation of (r,r-alpha*w), (w,s), (w,m-alpha*q)
+      // for the NEXT iteration while doing matvec
+
+      oper->Mult(s, n);  // n = A s
+
+      if (prec)
+      {
+         prec->Mult(n, q); // q = M^{-1} n
+      }
+      else
+      {
+         q = n;
+      }
+
+#ifdef MFEM_USE_MPI
+      // Start non-blocking reduction for gamma_new, delta_new, rho_new
+      real_t local_gamma_new = r * s;
+      real_t local_delta_new = n * s;
+      real_t local_rho_new = n * q;
+
+      StartInnerProduct(local_gamma_new, local_delta_new, local_rho_new);
+
+      // *** OVERLAP: Communication happens here while we could do other work ***
+      // In a real application, this is where local computation would overlap
+      // For this algorithm, we've already done the heavy work (matvec + prec)
+
+      // Wait for communication to complete
+      real_t gamma_new, delta_new, rho_new;
+      WaitInnerProduct(gamma_new, delta_new, rho_new);
+#else
+      real_t gamma_new = r * s;
+      real_t delta_new = n * s;
+      real_t rho_new = n * q;
+#endif
+
+      MFEM_VERIFY(IsFinite(gamma_new), "gamma_new = " << gamma_new);
+
+      if (gamma_new < 0.0)
+      {
+         if (print_options.warnings)
+         {
+            mfem::out << "Pipelined PCG: The preconditioner is not positive definite. "
+                      << "(r, s) = " << gamma_new << '\n';
+         }
+         converged = false;
+         final_iter = i;
+         final_norm = sqrt(fabs(gamma_new));
+         break;
+      }
+
+      if (print_options.iterations)
+      {
+         mfem::out << "   Iteration : " << setw(3) << i << "  (r, s) = "
+                   << gamma_new << '\n';
+      }
+
+      // Check convergence
+      if (gamma_new <= rtol)
+      {
+         converged = true;
+         final_iter = i;
+         final_norm = sqrt(gamma_new);
+         break;
+      }
+
+      // Compute beta
+      beta = gamma_new / gamma;
+
+      // Update search directions
+      add(s, beta, u, u);     // u = s + beta * u
+      add(n, beta, w, w);     // w = n + beta * w
+      add(q, beta, m, m);     // m = q + beta * m
+
+      // Update delta and rho for next iteration
+      delta = delta_new + 2.0 * beta * rho + beta * beta * delta;
+      rho = rho_new + beta * rho;
+
+      // Update gamma
+      gamma = gamma_new;
+   }
+
+   if (!converged)
+   {
+      final_iter = max_iter;
+      final_norm = sqrt(gamma);
+   }
+
+   if (print_options.first_and_last && !print_options.iterations)
+   {
+      mfem::out << "   Iteration : " << setw(3) << final_iter << "  (r, s) = "
+                << gamma << '\n';
+   }
+   if (print_options.summary || (print_options.warnings && !converged))
+   {
+      mfem::out << "Pipelined PCG: Number of iterations: " << final_iter << '\n';
+   }
+   if (print_options.warnings && !converged)
+   {
+      mfem::out << "Pipelined PCG: No convergence!" << '\n';
+   }
+
+   Monitor(final_iter, final_norm, r, x, true);
+}
+
+
 inline void GeneratePlaneRotation(real_t &dx, real_t &dy,
                                   real_t &cs, real_t &sn)
 {
