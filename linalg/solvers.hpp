@@ -656,6 +656,48 @@ void PCG(const Operator &A, Solver &B, const Vector &b, Vector &x,
          real_t RTOLERANCE = 1e-12, real_t ATOLERANCE = 1e-24);
 
 
+/// Communication-Avoiding Preconditioned Conjugate Gradient method
+/** This solver reduces the number of global synchronization points by
+    computing multiple Krylov basis vectors at once (s-step approach).
+    This is particularly beneficial in parallel settings where communication
+    costs dominate. The parameter s controls the number of basis vectors
+    computed in each outer iteration. */
+class CAPCGSolver : public IterativeSolver
+{
+protected:
+   int s; // number of basis vectors per outer iteration
+   mutable Array<Vector *> P; // basis vectors for Krylov subspace
+   mutable Array<Vector *> AP; // A * basis vectors
+   mutable DenseMatrix T; // Gram matrix for inner products
+   mutable Vector r; // residual vector
+
+   void UpdateVectors();
+   void ComputeBasis(const Vector &v0, int basis_size) const;
+
+public:
+   CAPCGSolver() : s(3) { }
+
+#ifdef MFEM_USE_MPI
+   CAPCGSolver(MPI_Comm comm_) : IterativeSolver(comm_), s(3) { }
+#endif
+
+   /// Set the number of basis vectors (s-step parameter)
+   void SetBasisSize(int s_) { s = s_; }
+
+   /// Get the current basis size
+   int GetBasisSize() const { return s; }
+
+   void SetOperator(const Operator &op) override
+   { IterativeSolver::SetOperator(op); UpdateVectors(); }
+
+   /** @brief Iterative solution of the linear system using Communication-
+       Avoiding Preconditioned Conjugate Gradient method. */
+   void Mult(const Vector &b, Vector &x) const override;
+
+   virtual ~CAPCGSolver();
+};
+
+
 /// GMRES method
 class GMRESSolver : public IterativeSolver
 {

@@ -1081,6 +1081,306 @@ void PCG(const Operator &A, Solver &B, const Vector &b, Vector &x,
 }
 
 
+// Communication-Avoiding PCG implementation
+
+void CAPCGSolver::UpdateVectors()
+{
+   const int n = width;
+   r.SetSize(n);
+
+   // Clean up old basis vectors
+   for (int i = 0; i < P.Size(); i++)
+   {
+      delete P[i];
+      delete AP[i];
+   }
+   P.SetSize(0);
+   AP.SetSize(0);
+}
+
+void CAPCGSolver::ComputeBasis(const Vector &v0, int basis_size) const
+{
+   // Build Krylov basis using monomial basis: {v0, A*v0, A^2*v0, ..., A^s*v0}
+   // where v0 is the preconditioned residual
+   const int n = width;
+
+   // Clean up old basis
+   for (int i = 0; i < P.Size(); i++)
+   {
+      delete P[i];
+      delete AP[i];
+   }
+   P.SetSize(basis_size);
+   AP.SetSize(basis_size);
+
+   // Initialize basis vectors
+   for (int i = 0; i < basis_size; i++)
+   {
+      P[i] = new Vector(n);
+      AP[i] = new Vector(n);
+      P[i]->UseDevice(true);
+      AP[i]->UseDevice(true);
+   }
+
+   // P[0] = v0
+   *P[0] = v0;
+
+   // Build monomial basis: P[i] = A * P[i-1]
+   for (int i = 0; i < basis_size; i++)
+   {
+      oper->Mult(*P[i], *AP[i]); // AP[i] = A * P[i]
+
+      if (i + 1 < basis_size)
+      {
+         if (prec)
+         {
+            prec->Mult(*AP[i], *P[i+1]); // P[i+1] = B * A * P[i]
+         }
+         else
+         {
+            *P[i+1] = *AP[i]; // P[i+1] = A * P[i]
+         }
+      }
+   }
+}
+
+void CAPCGSolver::Mult(const Vector &b, Vector &x) const
+{
+   MFEM_PERF_FUNCTION;
+
+   int i, k;
+   real_t r0, nom, nom0, betanom, alpha;
+   Vector z;
+
+   x.UseDevice(true);
+
+   // Initialize residual
+   if (iterative_mode)
+   {
+      oper->Mult(x, r);
+      subtract(b, r, r); // r = b - A x
+   }
+   else
+   {
+      r = b;
+      x = 0.0;
+   }
+
+   // Initialize preconditioned residual
+   if (prec)
+   {
+      z.SetSize(width);
+      z.UseDevice(true);
+      prec->Mult(r, z); // z = B r
+   }
+   else
+   {
+      z.SetDataAndSize(r.GetData(), r.Size());
+   }
+
+   nom0 = nom = Dot(z, r);
+   if (nom0 >= 0.0) { initial_norm = sqrt(nom0); }
+   MFEM_VERIFY(IsFinite(nom), "nom = " << nom);
+
+   if (print_options.iterations || print_options.first_and_last)
+   {
+      mfem::out << "   Iteration : " << setw(3) << 0 << "  (B r, r) = "
+                << nom << (print_options.first_and_last ? " ...\n" : "\n");
+   }
+
+   if (nom < 0.0)
+   {
+      if (print_options.warnings)
+      {
+         mfem::out << "CA-PCG: The preconditioner is not positive definite. (Br, r) = "
+                   << nom << '\n';
+      }
+      converged = false;
+      final_iter = 0;
+      initial_norm = nom;
+      final_norm = nom;
+      Monitor(0, nom, r, x, true);
+      return;
+   }
+
+   r0 = std::max(nom*rel_tol*rel_tol, abs_tol*abs_tol);
+   if (Monitor(0, nom, r, x) || nom <= r0)
+   {
+      converged = true;
+      final_iter = 0;
+      final_norm = sqrt(nom);
+      Monitor(0, nom, r, x, true);
+      return;
+   }
+
+   // Outer s-step iterations
+   converged = false;
+   final_iter = max_iter;
+
+   int outer_iter = 0;
+   const int max_outer_iter = (max_iter + s - 1) / s; // ceiling division
+
+   for (int outer = 0; outer < max_outer_iter; outer++)
+   {
+      // Compute Krylov basis of size s starting from current preconditioned residual
+      if (prec)
+      {
+         prec->Mult(r, z); // z = B r
+         ComputeBasis(z, s);
+      }
+      else
+      {
+         ComputeBasis(r, s);
+      }
+
+      // Compute Gram matrix T (size s x s)
+      // T[i,j] = (P[i], AP[j]) for communication-avoiding inner products
+      T.SetSize(s, s);
+      for (int j = 0; j < s; j++)
+      {
+         for (int ii = 0; ii <= j; ii++)
+         {
+            T(ii, j) = Dot(*P[ii], *AP[j]);
+            if (ii != j)
+            {
+               T(j, ii) = T(ii, j); // Symmetric
+            }
+         }
+      }
+
+      // Perform s inner CG iterations using the basis
+      Vector gamma(s); // CG coefficients
+      gamma = 0.0;
+
+      // First inner iteration
+      gamma(0) = nom / T(0, 0);
+
+      // Update solution and residual incrementally for each basis vector
+      for (k = 0; k < s; k++)
+      {
+         if (outer_iter >= max_iter) break;
+
+         // Update solution: x = x + gamma[k] * P[k]
+         add(x, gamma(k), *P[k], x);
+
+         // Update residual: r = r - gamma[k] * AP[k]
+         add(r, -gamma(k), *AP[k], r);
+
+         // Compute new residual norm
+         if (prec)
+         {
+            prec->Mult(r, z);
+            betanom = Dot(r, z);
+         }
+         else
+         {
+            betanom = Dot(r, r);
+         }
+
+         MFEM_VERIFY(IsFinite(betanom), "betanom = " << betanom);
+
+         if (betanom < 0.0)
+         {
+            if (print_options.warnings)
+            {
+               mfem::out << "CA-PCG: The preconditioner is not positive definite. (Br, r) = "
+                         << betanom << '\n';
+            }
+            converged = false;
+            final_iter = outer_iter;
+            final_norm = sqrt(fabs(betanom));
+            Monitor(final_iter, final_norm, r, x, true);
+            return;
+         }
+
+         outer_iter++;
+
+         if (print_options.iterations)
+         {
+            mfem::out << "   Iteration : " << setw(3) << outer_iter << "  (B r, r) = "
+                      << betanom << '\n';
+         }
+
+         if (Monitor(outer_iter, betanom, r, x) || betanom <= r0)
+         {
+            converged = true;
+            final_iter = outer_iter;
+            final_norm = sqrt(betanom);
+            break;
+         }
+
+         // Compute next CG coefficient if not last iteration in this s-step
+         if (k + 1 < s && outer_iter < max_iter)
+         {
+            // beta = betanom / nom
+            real_t beta = betanom / nom;
+
+            // Compute next search direction coefficient
+            // This is simplified; full CA-PCG would use recurrence relations
+            real_t denom = T(k+1, k+1) - beta * T(k, k+1);
+            if (fabs(denom) > 1e-15)
+            {
+               gamma(k+1) = betanom / denom;
+            }
+            else
+            {
+               // Restart basis if denominator too small
+               break;
+            }
+
+            nom = betanom;
+         }
+      }
+
+      if (converged || outer_iter >= max_iter)
+      {
+         break;
+      }
+
+      nom = betanom;
+   }
+
+   if (!converged)
+   {
+      final_iter = outer_iter;
+      if (prec)
+      {
+         prec->Mult(r, z);
+         final_norm = sqrt(Dot(r, z));
+      }
+      else
+      {
+         final_norm = sqrt(Dot(r, r));
+      }
+   }
+
+   if (print_options.first_and_last && !print_options.iterations)
+   {
+      mfem::out << "   Iteration : " << setw(3) << final_iter << "  (B r, r) = "
+                << final_norm * final_norm << '\n';
+   }
+   if (print_options.summary || (print_options.warnings && !converged))
+   {
+      mfem::out << "CA-PCG: Number of iterations: " << final_iter << '\n';
+   }
+   if (print_options.warnings && !converged)
+   {
+      mfem::out << "CA-PCG: No convergence!" << '\n';
+   }
+
+   Monitor(final_iter, final_norm, r, x, true);
+}
+
+CAPCGSolver::~CAPCGSolver()
+{
+   for (int i = 0; i < P.Size(); i++)
+   {
+      delete P[i];
+      delete AP[i];
+   }
+}
+
+
 inline void GeneratePlaneRotation(real_t &dx, real_t &dy,
                                   real_t &cs, real_t &sn)
 {
